@@ -1,107 +1,24 @@
-#!/usr/bin/env python3
-"""Baixa anexos .xlsx de uma conta Gmail via IMAP."""
-import os
-import imaplib
-import email
-from email.header import decode_header
-from email.message import Message
-from datetime import datetime
-
-# Configurações (use variáveis de ambiente ou edite aqui)
-EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "igor.guifreitas@gmail.com")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "ttjt ikdc ldqt eoew")
-IMAP_SERVER = os.environ.get("IMAP_SERVER", "imap.gmail.com")
-IMAP_PORT = int(os.environ.get("IMAP_PORT", 993))
-SAVE_DIR = os.environ.get("SAVE_DIR", "planilhas_baixadas")
-TARGET_SENDER = os.environ.get("TARGET_SENDER", "klaytonsantos@startbetgames.com")
-TARGET_SUBJECT = os.environ.get("TARGET_SUBJECT", "Relatório de Alerta de Risco")
-
-def connect() -> imaplib.IMAP4_SSL:
-    mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-    mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-    return mail
-
-def decode_mime_words(raw: str) -> str:
-    parts = decode_header(raw)
-    decoded = []
-    for part, enc in parts:
-        if isinstance(part, bytes):
-            decoded.append(part.decode(enc or "utf-8", errors="ignore"))
-        else:
-            decoded.append(part)
-    return "".join(decoded)
-
-def save_attachment(part: Message) -> None:
-    filename = part.get_filename()
-    if not filename:
-        return
-    filename = decode_mime_words(filename)
-    if not filename.lower().endswith(".xlsx"):
-        return
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(SAVE_DIR, f"{timestamp}_{filename}")
-    with open(out_path, "wb") as f:
-        f.write(part.get_payload(decode=True))
-    print(f"Salvo: {out_path}")
-
-def download_all_xlsx(mail: imaplib.IMAP4_SSL) -> None:
-    mail.select("INBOX")
-    criteria = [
-        "FROM", f'"{TARGET_SENDER}"',
-        "SUBJECT", f'"{TARGET_SUBJECT}"',
-    ]
-    status, data = mail.search("UTF-8", *criteria)
-    if status != "OK":
-        print("Falha ao buscar e-mails")
-        return
-
-    for num in data[0].split():
-        status, msg_data = mail.fetch(num, "(RFC822)")
-        if status != "OK":
-            continue
-        msg = email.message_from_bytes(msg_data[0][1])
-        from_addr = email.utils.parseaddr(msg.get("From"))[1].lower()
-        subject = decode_mime_words(msg.get("Subject", ""))
-        if from_addr != TARGET_SENDER.lower() or subject.strip().lower() != TARGET_SUBJECT.lower():
-            continue
-        for part in msg.walk():
-            if part.get_content_disposition() == "attachment":
-                save_attachment(part)
-
-def main():
-    mail = connect()
-    try:
-        download_all_xlsx(mail)
-    finally:
-        mail.logout()
-
-if __name__ == "__main__":
-    main()
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+
 """
-Analisador em Lote de Planilhas de Risco
-- Unifica .xlsx de uma pasta
-- Converte R$ e % para número
-- Calcula correlações e estatísticas
-- Gera gráficos (dispersões, heatmaps)
-- Abas no Excel:
-  * Base Unificada
-  * Correlacao_Pearson
-  * Correlacao_Spearman
-  * Estatisticas
-  * Top_Jogadores (alto risco)
-  * Top_Jogos (títulos com maior ROI/volume)
-  * Temporal_Resumo  <-- NOVO
+Analisador em Lote de Planilhas de Risco (IMAP Gmail integrado - sem argumentos)
+-------------------------------------------------------------------------------
+Fluxo:
+1) Baixa anexos do Gmail (IMAP/SSL) usando as credenciais/servidores abaixo
+2) Lê .xlsx da pasta-config
+3) Padroniza colunas, converte R$ e %
+4) Análise temporal, correlações, rankings, gráficos
+5) Exporta relatório Excel em ./saidas/
+
+Requisitos:
+  pip install pandas openpyxl matplotlib seaborn
 """
 
 import os
 import sys
-import argparse
 import glob
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 
 import pandas as pd
@@ -109,34 +26,132 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# Email/IMAP
+import imaplib
+import email
+from email.header import decode_header
 
 warnings.filterwarnings("ignore")
 
 # =========================
-# Utilitários
+# CONFIGURAÇÃO
 # =========================
 
-def parse_monetary_value(value):
-    if pd.isna(value) or value in ('N/A', '', None):
-        return 0.0
-    if isinstance(value, (int, float, np.integer, np.floating)):
-        return float(value)
-    s = str(value).replace('R$', '').replace('.', '').replace(',', '.').strip()
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
+class Config:
+    # >>>>> EDITE AQUI (GMAIL)
+    EMAIL_ADDRESS = "igor.guifreitas@gmail.com"
+    EMAIL_PASSWORD = "ttjt ikdc ldqt eoew"   # Senha de App do Gmail (16 chars)
+    IMAP_SERVER = "imap.gmail.com"
+    IMAP_PORT = 993
 
-def parse_percentage(value):
-    if pd.isna(value) or value in ('', None):
-        return 0.0
-    if isinstance(value, (int, float, np.integer, np.floating)):
-        return float(value)
-    s = str(value).replace('%', '').replace(',', '.').strip()
+    # SMTP opcional (não usado neste script, mas deixo documentado)
+    SMTP_SERVER = "smtp.gmail.com"
+    SMTP_PORT = 587
+
+    # Filtro de busca
+    EMAIL_SUBJECT_CONTAINS = "Relatório de Alerta de Risco"
+    DAYS_LOOKBACK = 10   # buscar emails desde N dias atrás
+
+    # Pastas locais
+    DOWNLOAD_DIR = r"C:\Users\igor.santos\Desktop\Analise_Risco\analise_risco\planilhas_baixadas"
+    SAIDAS_DIR = "saidas"
+
+# =========================
+# Funções auxiliares
+# =========================
+
+def _decode_str(x):
+    if not x:
+        return ""
+    parts = decode_header(x)
+    out = ""
+    for txt, enc in parts:
+        if isinstance(txt, bytes):
+            try:
+                out += txt.decode(enc or "utf-8", errors="ignore")
+            except Exception:
+                out += txt.decode("utf-8", errors="ignore")
+        else:
+            out += txt
+    return out
+
+def _imap_since(days: int) -> str:
+    dt = datetime.now() - timedelta(days=max(0, days))
+    return dt.strftime("%d-%b-%Y")  # formato IMAP: 01-Jan-2025
+
+def download_gmail_attachments(
+    user: str,
+    app_password: str,
+    subject_contains: str,
+    download_dir: str,
+    days: int = 7,
+    allowed_ext=(".xlsx",),
+    mailbox: str = "INBOX"
+) -> int:
+    """
+    Conecta no Gmail via IMAP e baixa anexos que batem com o assunto.
+    Retorna a quantidade de arquivos salvos.
+    """
+    os.makedirs(download_dir, exist_ok=True)
+    since_str = _imap_since(days)
+    saved_count = 0
+
+    M = imaplib.IMAP4_SSL(Config.IMAP_SERVER, Config.IMAP_PORT)
     try:
-        return float(s)
-    except Exception:
-        return 0.0
+        M.login(user, app_password)
+        M.select(mailbox)
+        typ, data = M.search(None, f'(SINCE "{since_str}")')
+        if typ != "OK":
+            print("[IMAP] Falha ao buscar mensagens.")
+            return 0
+
+        msg_ids = data[0].split()
+        print(f"[IMAP] Mensagens encontradas desde {since_str}: {len(msg_ids)}")
+
+        for mid in reversed(msg_ids):  # mais recentes primeiro
+            typ, msg_data = M.fetch(mid, "(RFC822)")
+            if typ != "OK":
+                continue
+            raw = msg_data[0][1]
+            msg = email.message_from_bytes(raw)
+
+            subj = _decode_str(msg.get("Subject", ""))
+            if subject_contains and (subject_contains.lower() not in subj.lower()):
+                continue
+
+            for part in msg.walk():
+                cd = str(part.get("Content-Disposition") or "")
+                if "attachment" not in cd.lower():
+                    continue
+                filename = _decode_str(part.get_filename() or "")
+                if not filename:
+                    continue
+                if not filename.lower().endswith(allowed_ext):
+                    continue
+
+                # evitar overwrite
+                base, ext = os.path.splitext(filename)
+                out = os.path.join(download_dir, filename)
+                n = 1
+                while os.path.exists(out):
+                    out = os.path.join(download_dir, f"{base}_{n}{ext}")
+                    n += 1
+
+                payload = part.get_payload(decode=True)
+                if payload:
+                    with open(out, "wb") as f:
+                        f.write(payload)
+                    saved_count += 1
+        return saved_count
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+# =========================
+# Padronização de dados
+# =========================
 
 COLUMN_MAPPING = {
     'Status Atual': 'status',
@@ -158,7 +173,7 @@ COLUMN_MAPPING = {
     'Win Rate % (5h)': 'win_rate_5h',
     'Lucro/Perda Líquido (5h)': 'lucro_perda_5h',
     'Qtd Saques por Dia (máx nos últimos 7d)': 'qtd_saques_dia',
-    # variações
+    # variações comuns
     'ID Usuario': 'user_id',
     'Saldo': 'saldo',
     'data do cadastro': 'data_cadastro',
@@ -184,26 +199,41 @@ MONETARY_COLS = [
     'volume_apostado_5h','ticket_medio_5h','aposta_max_5h',
     'aposta_min_5h','volume_retornado_5h','lucro_perda_5h'
 ]
-
 NUMERIC_COLS = ['qtd_apostas_5h','qtd_greens_5h','qtd_reds_5h','qtd_saques_dia']
 
-# =========================
-# Núcleo
-# =========================
-
-def read_one_excel(path, sheet=None):
+def parse_monetary_value(value):
+    if pd.isna(value) or value in ('N/A', '', None):
+        return 0.0
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    s = str(value).replace('R$', '').replace('.', '').replace(',', '.').strip()
     try:
-        if sheet is None:
-            xls = pd.ExcelFile(path)
-            candidate = None
-            for s in xls.sheet_names:
-                df_try = pd.read_excel(path, sheet_name=s)
-                if df_try.shape[1] >= 5 and len(df_try) >= 1:
-                    candidate = s
-                    break
-            sheet_to_read = candidate if candidate else xls.sheet_names[0]
-        else:
-            sheet_to_read = sheet
+        return float(s)
+    except Exception:
+        return 0.0
+
+def parse_percentage(value):
+    if pd.isna(value) or value in ('', None):
+        return 0.0
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    s = str(value).replace('%', '').replace(',', '.').strip()
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def read_one_excel(path):
+    try:
+        xls = pd.ExcelFile(path)
+        # escolhe a 1ª aba com conteúdo "rico"
+        candidate = None
+        for s in xls.sheet_names:
+            df_try = pd.read_excel(path, sheet_name=s)
+            if df_try.shape[1] >= 5 and len(df_try) >= 1:
+                candidate = s
+                break
+        sheet_to_read = candidate if candidate else xls.sheet_names[0]
 
         df = pd.read_excel(path, sheet_name=sheet_to_read)
         df = df.rename(columns=COLUMN_MAPPING)
@@ -223,24 +253,18 @@ def standardize_types(df: pd.DataFrame) -> pd.DataFrame:
     for col in NUMERIC_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    # datas
     if 'data_cadastro' in df.columns:
         df['data_cadastro'] = pd.to_datetime(df['data_cadastro'], errors='coerce')
     return df
 
-# ===== NOVO: análise temporal
+# ===== análise temporal
 def add_temporal_analysis(df: pd.DataFrame) -> pd.DataFrame:
-    """Adiciona análise de padrões temporais no DataFrame."""
     if 'data_cadastro' in df.columns:
-        # já convertido em standardize_types
         now = datetime.now()
         df['dias_desde_cadastro'] = (now - df['data_cadastro']).dt.days
         df['dias_desde_cadastro'] = df['dias_desde_cadastro'].fillna(-1).astype(int)
-
         if 'volume_apostado_5h' in df.columns:
             df['velocidade_apostas'] = df['volume_apostado_5h'] / (df['dias_desde_cadastro'].clip(lower=0) + 1)
-
-        # Flag contas novas com alto volume (quantil 80 do volume)
         vol_q80 = df['volume_apostado_5h'].quantile(0.80) if 'volume_apostado_5h' in df.columns else np.nan
         df['conta_nova_alto_risco'] = (
             (df['dias_desde_cadastro'] >= 0) &
@@ -249,11 +273,12 @@ def add_temporal_analysis(df: pd.DataFrame) -> pd.DataFrame:
         )
     return df
 
+# ===== correlações
 def make_correlations(df: pd.DataFrame):
     candidates = [
         'qtd_greens_5h','qtd_reds_5h','win_rate_5h','aposta_max_5h','aposta_min_5h',
         'volume_apostado_5h','volume_retornado_5h','lucro_perda_5h','net_deposit_7d',
-        'risk_score','qtd_apostas_5h'
+        'qtd_apostas_5h'
     ]
     cols = [c for c in candidates if c in df.columns]
     if not cols:
@@ -280,7 +305,7 @@ def save_heatmap(corr: pd.DataFrame, title: str, outpath: str):
     plt.savefig(outpath, dpi=200)
     plt.close()
 
-# ===== Top_Jogadores
+# ===== rankings e resumos
 def build_top_players(df: pd.DataFrame, top_percent_volume: float = 0.95,
                       min_winrate: float = 70.0, only_player_profit: bool = True,
                       min_qtd_apostas: int = 10, top_n: int = 200) -> pd.DataFrame:
@@ -292,26 +317,19 @@ def build_top_players(df: pd.DataFrame, top_percent_volume: float = 0.95,
 
     vol_thr = base['volume_apostado_5h'].quantile(top_percent_volume) if 'volume_apostado_5h' in base else 0
     conds = pd.Series(True, index=base.index)
-
-    if 'win_rate_5h' in base:
-        conds &= base['win_rate_5h'] >= min_winrate
-    if 'volume_apostado_5h' in base:
-        conds &= base['volume_apostado_5h'] >= vol_thr
-    if 'lucro_perda_5h' in base and only_player_profit:
-        conds &= base['lucro_perda_5h'] > 0
-    if 'qtd_apostas_5h' in base:
-        conds &= base['qtd_apostas_5h'] >= min_qtd_apostas
+    if 'win_rate_5h' in base: conds &= base['win_rate_5h'] >= min_winrate
+    if 'volume_apostado_5h' in base: conds &= base['volume_apostado_5h'] >= vol_thr
+    if 'lucro_perda_5h' in base and only_player_profit: conds &= base['lucro_perda_5h'] > 0
+    if 'qtd_apostas_5h' in base: conds &= base['qtd_apostas_5h'] >= min_qtd_apostas
 
     top = base[conds].copy()
 
-    # ROI auxiliar
     if {'volume_apostado_5h','lucro_perda_5h'}.issubset(top.columns):
         top['roi_5h_%'] = np.where(top['volume_apostado_5h']>0,
                                    100*top['lucro_perda_5h']/top['volume_apostado_5h'], 0)
 
-    # Ranking: prioriza contas novas alto risco primeiro
     sort_cols = []
-    if 'conta_nova_alto_risco' in top: sort_cols.append(('conta_nova_alto_risco', False))  # True > False
+    if 'conta_nova_alto_risco' in top: sort_cols.append(('conta_nova_alto_risco', False))
     if 'win_rate_5h' in top: sort_cols.append(('win_rate_5h', False))
     if 'volume_apostado_5h' in top: sort_cols.append(('volume_apostado_5h', False))
     if 'lucro_perda_5h' in top: sort_cols.append(('lucro_perda_5h', False))
@@ -328,7 +346,6 @@ def build_top_players(df: pd.DataFrame, top_percent_volume: float = 0.95,
     ] if c in top.columns]
     return top[final_order] if final_order else top
 
-# ===== Top_Jogos
 def build_top_games(df: pd.DataFrame, perc_volume_game: float = 0.95,
                     min_distinct_players: int = 10, top_n: int = 200) -> pd.DataFrame:
     req = {'jogo_mais_jogado','volume_apostado_5h','volume_retornado_5h','lucro_perda_5h','qtd_apostas_5h','user_id'}
@@ -344,12 +361,9 @@ def build_top_games(df: pd.DataFrame, perc_volume_game: float = 0.95,
     ).reset_index()
 
     grp['roi_%'] = np.where(grp['volume_total']>0, 100*grp['lucro_jogadores']/grp['volume_total'], 0)
-
     vol_thr = grp['volume_total'].quantile(perc_volume_game) if len(grp) else 0
     mask = (grp['volume_total'] >= vol_thr) & (grp['jogadores_distintos'] >= min_distinct_players)
-    top_games = grp.loc[mask].copy()
-
-    top_games = top_games.sort_values(by=['roi_%','volume_total'], ascending=[False, False])
+    top_games = grp.loc[mask].copy().sort_values(by=['roi_%','volume_total'], ascending=[False, False])
 
     if len(top_games) > top_n:
         top_games = top_games.head(top_n)
@@ -357,10 +371,8 @@ def build_top_games(df: pd.DataFrame, perc_volume_game: float = 0.95,
     cols = ['jogo_mais_jogado','roi_%','volume_total','retorno_total','lucro_jogadores','apostas_totais','jogadores_distintos']
     return top_games[cols]
 
-# ===== Resumo temporal para Excel
 def build_temporal_summary(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    # Estatísticas básicas
     if 'dias_desde_cadastro' in df.columns:
         dias = df['dias_desde_cadastro'].replace({-1: np.nan})
         rows.append({'metric': 'dias_desde_cadastro_média', 'value': dias.mean()})
@@ -373,7 +385,6 @@ def build_temporal_summary(df: pd.DataFrame) -> pd.DataFrame:
         pct = 100*df['conta_nova_alto_risco'].mean()
         rows.append({'metric': 'pct_contas_novas_alto_risco', 'value': pct})
 
-    # Distribuição por faixas de idade
     if 'dias_desde_cadastro' in df.columns:
         bins = [-1, 0, 7, 30, 90, 180, 365, 99999]
         labels = ['sem_data','0d','1-7d','8-30d','31-90d','91-180d','>180d']
@@ -381,137 +392,99 @@ def build_temporal_summary(df: pd.DataFrame) -> pd.DataFrame:
         dist = cut.value_counts(dropna=False).rename_axis('faixa_dias').reset_index(name='qtd')
         dist['metric'] = 'distribuicao_faixas_dias'
         rows.extend(dist[['metric','faixa_dias','qtd']].to_dict('records'))
+    return pd.DataFrame(rows)
 
-    out = pd.DataFrame(rows)
-    return out
-# =========================
-# Novos gráficos
-# =========================
-
-def plot_profit_by_winrate_bins(df: pd.DataFrame, outpath: str = "saidas/boxplot_lucro_winrate.png"):
-    """Boxplot de lucro/perda por faixas de win rate."""
+# ===== novos gráficos
+def plot_profit_by_winrate_bins(df: pd.DataFrame, outpath: str):
     if 'win_rate_5h' not in df.columns or 'lucro_perda_5h' not in df.columns:
         return
     df = df.copy()
-    # garante numérico
     df['win_rate_5h'] = pd.to_numeric(df['win_rate_5h'], errors='coerce')
     df['lucro_perda_5h'] = pd.to_numeric(df['lucro_perda_5h'], errors='coerce')
-    # cria bins
-    df['winrate_bin'] = pd.cut(
-        df['win_rate_5h'],
-        bins=[0, 30, 50, 70, 100],
-        labels=['Baixo', 'Médio', 'Alto', 'Suspeito'],
-        include_lowest=True
-    )
-    # remove NaN
-    df = df.dropna(subset=['winrate_bin', 'lucro_perda_5h'])
+    df['winrate_bin'] = pd.cut(df['win_rate_5h'], bins=[0,30,50,70,100],
+                               labels=['Baixo','Médio','Alto','Suspeito'], include_lowest=True)
+    df = df.dropna(subset=['winrate_bin','lucro_perda_5h'])
     if df.empty:
         return
-
     plt.figure(figsize=(8,6))
     df.boxplot(column='lucro_perda_5h', by='winrate_bin')
     plt.title('Distribuição de Lucros por Faixa de Win Rate')
     plt.suptitle('')
-    plt.xlabel('Faixa de Win Rate')
-    plt.ylabel('Lucro/Perda (R$)')
+    plt.xlabel('Faixa de Win Rate'); plt.ylabel('Lucro/Perda (R$)')
     plt.tight_layout()
     plt.savefig(outpath, dpi=180)
     plt.close()
 
-
-def plot_temporal_heatmap(df: pd.DataFrame, outpath: str = "saidas/heatmap_temporal.png"):
-    """Heatmap de lucro/perda por mês de cadastro vs. faixa de win rate."""
-    req_cols = {'data_cadastro','win_rate_5h','lucro_perda_5h'}
-    if not req_cols.issubset(df.columns):
+def plot_temporal_heatmap(df: pd.DataFrame, outpath: str):
+    req = {'data_cadastro','win_rate_5h','lucro_perda_5h'}
+    if not req.issubset(df.columns):
         return
-
     df = df.copy()
     df['data_cadastro'] = pd.to_datetime(df['data_cadastro'], errors='coerce')
     df['win_rate_5h'] = pd.to_numeric(df['win_rate_5h'], errors='coerce')
     df['lucro_perda_5h'] = pd.to_numeric(df['lucro_perda_5h'], errors='coerce')
-
-    # bins (mesmos do boxplot)
-    df['winrate_bin'] = pd.cut(
-        df['win_rate_5h'],
-        bins=[0, 30, 50, 70, 100],
-        labels=['Baixo', 'Médio', 'Alto', 'Suspeito'],
-        include_lowest=True
-    )
-
+    df['winrate_bin'] = pd.cut(df['win_rate_5h'], bins=[0,30,50,70,100],
+                               labels=['Baixo','Médio','Alto','Suspeito'], include_lowest=True)
     df = df.dropna(subset=['data_cadastro','winrate_bin','lucro_perda_5h'])
     if df.empty:
         return
-
     df['mes_cadastro'] = df['data_cadastro'].dt.to_period('M').astype(str)
-
-    pivot = df.pivot_table(
-        values='lucro_perda_5h',
-        index='mes_cadastro',
-        columns='winrate_bin',
-        aggfunc='sum',
-        fill_value=0
-    )
-
+    pivot = df.pivot_table(values='lucro_perda_5h', index='mes_cadastro', columns='winrate_bin',
+                           aggfunc='sum', fill_value=0)
     plt.figure(figsize=(9,6))
     ax = sns.heatmap(pivot, annot=True, fmt='.0f', cmap='RdYlGn_r')
-    ax.set_xlabel('Faixa de Win Rate')
-    ax.set_ylabel('Mês de Cadastro')
+    ax.set_xlabel('Faixa de Win Rate'); ax.set_ylabel('Mês de Cadastro')
     plt.title('Lucro/Perda por Mês de Cadastro e Faixa de Win Rate')
     plt.tight_layout()
     plt.savefig(outpath, dpi=180)
     plt.close()
+
 # =========================
-# Main
+# MAIN
 # =========================
 
 def main():
-    parser = argparse.ArgumentParser(description="Unificar e analisar múltiplas planilhas de risco (.xlsx)")
-    parser.add_argument("--pasta", required=True, help="Caminho da pasta contendo os .xlsx")
-    parser.add_argument("--aba", default=None, help="Nome da aba (sheet) a ler em cada arquivo (opcional)")
+    # 1) Baixar anexos do Gmail
+    print("[1/4] Baixando anexos do Gmail…")
+    saved = download_gmail_attachments(
+        user=Config.EMAIL_ADDRESS,
+        app_password=Config.EMAIL_PASSWORD,
+        subject_contains=Config.EMAIL_SUBJECT_CONTAINS,
+        download_dir=Config.DOWNLOAD_DIR,
+        days=Config.DAYS_LOOKBACK,
+        allowed_ext=(".xlsx",)
+    )
+    print(f"[IMAP] Arquivos .xlsx salvos: {saved}")
 
-    # Top_Jogadores
-    parser.add_argument("--min_winrate", type=float, default=70.0)
-    parser.add_argument("--perc_volume", type=float, default=0.95, help="Percentil de volume (0-1) para filtrar alto volume (jogadores)")
-    parser.add_argument("--min_apostas", type=int, default=10)
-    parser.add_argument("--top_n", type=int, default=200)
-    parser.add_argument("--somente_lucro_jogador", action="store_true", help="Filtra apenas quem teve lucro (lucro_perda_5h > 0)")
-
-    # Top_Jogos
-    parser.add_argument("--perc_volume_jogo", type=float, default=0.95, help="Percentil de volume por jogo para entrar no ranking")
-    parser.add_argument("--min_jogadores_jogo", type=int, default=10, help="Mínimo de jogadores distintos por jogo")
-
-    args = parser.parse_args()
-
-    pasta = args.pasta
-    sheet = args.aba
-    arquivos = sorted(glob.glob(os.path.join(pasta, "*.xlsx")))
+    # 2) Ler planilhas
+    print("[2/4] Lendo planilhas…")
+    arquivos = sorted(glob.glob(os.path.join(Config.DOWNLOAD_DIR, "*.xlsx")))
     if not arquivos:
-        print(f"[ERRO] Nenhum .xlsx encontrado em: {pasta}")
+        print(f"[ERRO] Nenhum .xlsx encontrado em: {Config.DOWNLOAD_DIR}")
         sys.exit(1)
 
-    print(f"Encontrados {len(arquivos)} arquivos .xlsx. Lendo...")
     dfs = []
     for path in arquivos:
-        df = read_one_excel(path, sheet=sheet)
+        df = read_one_excel(path)
         if df is None or df.empty:
             continue
         df = standardize_types(df)
-        df = add_temporal_analysis(df)   # <<< NOVO no pipeline
+        df = add_temporal_analysis(df)
         dfs.append(df)
 
     if not dfs:
-        print("[ERRO] Nenhum arquivo pôde ser lido com sucesso.")
+        print("[ERRO] Nenhum arquivo válido após leitura/padronização.")
         sys.exit(1)
 
     base = pd.concat(dfs, ignore_index=True)
-    print(f"Base unificada: {base.shape[0]:,} linhas x {base.shape[1]} colunas")
+    print(f"[INFO] Base unificada: {base.shape[0]:,} linhas x {base.shape[1]} colunas")
 
-    descr = base.describe(include='all').fillna("")
+    # 3) Análises e gráficos
+    print("[3/4] Calculando correlações e gerando gráficos…")
     pearson, spearman = make_correlations(base)
 
-    os.makedirs("saidas", exist_ok=True)
+    os.makedirs(Config.SAIDAS_DIR, exist_ok=True)
 
-    # Dispersões padrão
     def scatter(x, y, fname):
         if x in base.columns and y in base.columns:
             plt.figure()
@@ -519,63 +492,29 @@ def main():
             plt.xlabel(x); plt.ylabel(y)
             plt.title(f"Dispersão: {x} vs {y}")
             plt.tight_layout()
-            plt.savefig(os.path.join("saidas", fname), dpi=180)
+            plt.savefig(os.path.join(Config.SAIDAS_DIR, fname), dpi=180)
             plt.close()
 
     scatter("qtd_greens_5h", "qtd_reds_5h", "disp_greens_vs_reds.png")
     scatter("qtd_greens_5h", "win_rate_5h", "disp_greens_vs_winrate.png")
     scatter("volume_apostado_5h", "lucro_perda_5h", "disp_volume_vs_lucro.png")
 
-    save_heatmap(pearson, "Correlação de Pearson", os.path.join("saidas", "heatmap_pearson.png"))
-    save_heatmap(spearman, "Correlação de Spearman", os.path.join("saidas", "heatmap_spearman.png"))
-   
-    # Gráficos de dispersão e heatmaps já existentes...
-    scatter("qtd_greens_5h", "qtd_reds_5h", "disp_greens_vs_reds.png")
-    scatter("qtd_greens_5h", "win_rate_5h", "disp_greens_vs_winrate.png")
-    scatter("volume_apostado_5h", "lucro_perda_5h", "disp_volume_vs_lucro.png")
+    save_heatmap(pearson, "Correlação de Pearson", os.path.join(Config.SAIDAS_DIR, "heatmap_pearson.png"))
+    save_heatmap(spearman, "Correlação de Spearman", os.path.join(Config.SAIDAS_DIR, "heatmap_spearman.png"))
 
-    save_heatmap(pearson, "Correlação de Pearson", os.path.join("saidas", "heatmap_pearson.png"))
-    save_heatmap(spearman, "Correlação de Spearman", os.path.join("saidas", "heatmap_spearman.png"))
+    plot_profit_by_winrate_bins(base, outpath=os.path.join(Config.SAIDAS_DIR, "boxplot_lucro_winrate.png"))
+    plot_temporal_heatmap(base, outpath=os.path.join(Config.SAIDAS_DIR, "heatmap_temporal.png"))
 
-    # >>> NOVOS GRÁFICOS
-    plot_profit_by_winrate_bins(base, outpath=os.path.join("saidas","boxplot_lucro_winrate.png"))
-    plot_temporal_heatmap(base, outpath=os.path.join("saidas","heatmap_temporal.png"))
-
-    # Rankings
-    top_players = build_top_players(
-        base,
-        top_percent_volume=args.perc_volume,
-        min_winrate=args.min_winrate,
-        only_player_profit=args.somente_lucro_jogador,
-        min_qtd_apostas=args.min_apostas,
-        top_n=args.top_n
-    )
-
-    top_games = build_top_games(
-        base,
-        perc_volume_game=args.perc_volume_jogo,
-        min_distinct_players=args.min_jogadores_jogo,
-        top_n=args.top_n
-    )
-
-    # Resumo temporal
+    # Rankings e resumo temporal
+    print("[3/4] Construindo rankings e resumos…")
+    top_players = build_top_players(base)
+    top_games = build_top_games(base)
     temporal_summary = build_temporal_summary(base)
 
+    # 4) Exportar Excel
+    print("[4/4] Exportando relatório Excel…")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    relatorio_path = os.path.join("saidas", f"relatorio_correlacoes_{ts}.xlsx")
-
-    # Tabela auxiliar de bins de win rate
-    win_bins_tbl = None
-    if 'win_rate_5h' in base.columns:
-        tmp = base[['win_rate_5h']].copy()
-        tmp['winrate_bin'] = pd.cut(
-            pd.to_numeric(tmp['win_rate_5h'], errors='coerce'),
-            bins=[0, 30, 50, 70, 100],
-            labels=['Baixo', 'Médio', 'Alto', 'Suspeito'],
-            include_lowest=True
-        )
-        win_bins_tbl = tmp['winrate_bin'].value_counts(dropna=False).rename_axis('faixa').reset_index(name='qtd')
-
+    relatorio_path = os.path.join(Config.SAIDAS_DIR, f"relatorio_correlacoes_{ts}.xlsx")
 
     with pd.ExcelWriter(relatorio_path, engine="openpyxl") as writer:
         base.to_excel(writer, sheet_name="Base Unificada", index=False)
@@ -583,25 +522,16 @@ def main():
             pearson.to_excel(writer, sheet_name="Correlacao_Pearson")
         if not spearman.empty:
             spearman.to_excel(writer, sheet_name="Correlacao_Spearman")
-        descr.to_excel(writer, sheet_name="Estatisticas")
+        base.describe(include='all').fillna("").to_excel(writer, sheet_name="Estatisticas")
         if not top_players.empty:
             top_players.to_excel(writer, sheet_name="Top_Jogadores", index=False)
         if not top_games.empty:
             top_games.to_excel(writer, sheet_name="Top_Jogos", index=False)
         if not temporal_summary.empty:
             temporal_summary.to_excel(writer, sheet_name="Temporal_Resumo", index=False)
-        if win_bins_tbl is not None:
-            win_bins_tbl.to_excel(writer, sheet_name="WinRate_Bins", index=False)
-
 
     print(f"OK! Relatório salvo em: {relatorio_path}")
-    print("Imagens geradas em: ./saidas/ (dispersões e heatmaps)")
-    if not top_players.empty:
-        print(f"Top_Jogadores: {len(top_players)} registros.")
-    if not top_games.empty:
-        print(f"Top_Jogos: {len(top_games)} títulos.")
-    if not temporal_summary.empty:
-        print("Temporal_Resumo: gerado.")
+    print("Imagens em: ./saidas/ (dispersões, heatmaps, boxplot, temporal)")
 
 if __name__ == "__main__":
     main()
